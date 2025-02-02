@@ -253,12 +253,22 @@ class TendermintLogAnalyzer:
                     self.height_samples[entry.height].append(entry)
 
     def save_organized_logs(self, output_dir: str) -> None:
-        os.makedirs(output_dir, exist_ok=True)
+        # Create subdirectories for each grouping.
+        time_dir    = os.path.join(output_dir, "time")
+        level_dir   = os.path.join(output_dir, "level")
+        module_dir  = os.path.join(output_dir, "module")
+        height_dir  = os.path.join(output_dir, "height")
+        pattern_dir = os.path.join(output_dir, "pattern")
+
+        for d in [time_dir, level_dir, module_dir, height_dir, pattern_dir]:
+            os.makedirs(d, exist_ok=True)
+
         with tqdm(total=5, desc="Saving organized logs") as pbar:
             # Save time-based logs.
             for time_key, count in self.time_counts.items():
                 safe_time = re.sub(r'[^\w\-_\. ]', '_', time_key)
-                with open(os.path.join(output_dir, f"time_{safe_time}.log"), 'w', encoding='utf-8') as f:
+                file_path = os.path.join(time_dir, f"time_{safe_time}.log")
+                with open(file_path, 'w', encoding='utf-8') as f:
                     f.write(f"Total entries: {count}\n")
                     f.write("-" * 80 + "\n")
                     for entry in self.time_samples[time_key]:
@@ -267,7 +277,8 @@ class TendermintLogAnalyzer:
 
             # Save level-based logs.
             for level, count in self.level_counts.items():
-                with open(os.path.join(output_dir, f"level_{level}.log"), 'w', encoding='utf-8') as f:
+                file_path = os.path.join(level_dir, f"level_{level}.log")
+                with open(file_path, 'w', encoding='utf-8') as f:
                     f.write(f"Total entries: {count}\n")
                     f.write("-" * 80 + "\n")
                     for entry in self.level_samples[level]:
@@ -277,7 +288,8 @@ class TendermintLogAnalyzer:
             # Save module-based logs.
             for module, count in self.module_counts.items():
                 safe_module = re.sub(r'[^\w\-_\.]', '_', module)
-                with open(os.path.join(output_dir, f"module_{safe_module}.log"), 'w', encoding='utf-8') as f:
+                file_path = os.path.join(module_dir, f"module_{safe_module}.log")
+                with open(file_path, 'w', encoding='utf-8') as f:
                     f.write(f"Total entries: {count}\n")
                     f.write("-" * 80 + "\n")
                     for entry in self.module_samples[module]:
@@ -294,7 +306,8 @@ class TendermintLogAnalyzer:
                         self.height_samples[height][: self.max_samples - len(height_ranges[range_key][1])]
                     )
             for range_key, (count, samples) in height_ranges.items():
-                with open(os.path.join(output_dir, f"height_{range_key}.log"), 'w', encoding='utf-8') as f:
+                file_path = os.path.join(height_dir, f"height_{range_key}.log")
+                with open(file_path, 'w', encoding='utf-8') as f:
                     f.write(f"Total entries in range: {count}\n")
                     f.write("-" * 80 + "\n")
                     for entry in samples:
@@ -304,7 +317,8 @@ class TendermintLogAnalyzer:
             # Save pattern-based logs (top 50 patterns).
             top_patterns = sorted(self.pattern_counts.items(), key=lambda x: x[1], reverse=True)[:50]
             for i, (pattern, count) in enumerate(top_patterns):
-                with open(os.path.join(output_dir, f"pattern_{i:03d}.log"), 'w', encoding='utf-8') as f:
+                file_path = os.path.join(pattern_dir, f"pattern_{i:03d}.log")
+                with open(file_path, 'w', encoding='utf-8') as f:
                     f.write(f"Pattern: {pattern}\n")
                     f.write(f"Occurrences: {count}\n")
                     f.write("-" * 80 + "\n")
