@@ -33,7 +33,16 @@ class TendermintLogAnalyzer:
     def __init__(self, chunk_size=1024*1024*10):
         self.chunk_size = chunk_size
         self.pattern_lock = threading.Lock()
-        self.results_queue = queue.Queue()
+        
+        # Store counts instead of full entries
+        self.pattern_counts = defaultdict(int)
+        self.level_counts = defaultdict(int)
+        self.module_counts = defaultdict(int)
+        self.height_counts = defaultdict(int)
+        
+        # Keep only sample entries for patterns
+        self.pattern_samples = {}  # Store just a few examples per pattern
+        self.max_samples = 5
         
         # Tendermint/Cosmos specific patterns
         self.patterns = [
@@ -67,12 +76,20 @@ class TendermintLogAnalyzer:
     def parse_json_log(self, line: str) -> Optional[LogEntry]:
         try:
             data = json.loads(line)
+            # Convert height to int explicitly
+            height = None
+            if 'height' in data:
+                try:
+                    height = int(data['height'])
+                except (ValueError, TypeError):
+                    pass
+                
             return LogEntry(
                 timestamp=data.get('time', ''),
                 level=data.get('level', '').upper(),
                 module=data.get('module', ''),
                 message=data.get('message', ''),
-                height=data.get('height'),
+                height=height,  # Now properly typed as Optional[int]
                 original_message=line,
                 normalized_message=self.normalize_message(data.get('message', '')),
                 metadata=data
@@ -183,62 +200,92 @@ class TendermintLogAnalyzer:
 
     def _organize_entries(self, entries: List[LogEntry]) -> None:
         for entry in entries:
-            self.logs_by_time[entry.timestamp].append(entry)
+            pattern = entry.normalized_message
+            
+            # Update counts
+            self.pattern_counts[pattern] += 1
             if entry.level:
-                self.logs_by_level[entry.level].append(entry)
+                self.level_counts[entry.level] += 1
             if entry.module:
-                self.logs_by_module[entry.module].append(entry)
+                self.module_counts[entry.module] += 1
             if entry.height is not None:
-                self.logs_by_height[entry.height].append(entry)
-            self.pattern_groups[entry.normalized_message].append(entry)
+                self.height_counts[entry.height] += 1
+            
+            # Store sample if needed
+            if pattern not in self.pattern_samples:
+                self.pattern_samples[pattern] = []
+            if len(self.pattern_samples[pattern]) < self.max_samples:
+                self.pattern_samples[pattern].append(entry)
+
 
     def save_organized_logs(self, output_dir: str) -> None:
         os.makedirs(output_dir, exist_ok=True)
-        
+
         with tqdm(total=5, desc="Saving organized logs") as pbar:
-            # Save time-based logs
-            for time_key, entries in self.logs_by_time.items():
+            # Save time-based logs in chunks
+            for time_key, count in self.time_counts.items():
                 safe_time = re.sub(r'[^\w\-_\. ]', '_', time_key)
                 with open(f"{output_dir}/time_{safe_time}.log", 'w') as f:
-                    for entry in entries:
+                    f.write(f"Total entries: {count}\n")
+                    f.write("-" * 80 + "\n")
+                    for entry in self.time_samples[time_key]:
                         f.write(f"{entry.original_message}\n")
             pbar.update(1)
 
             # Save level-based logs
-            for level, entries in self.logs_by_level.items():
+            for level, count in self.level_counts.items():
                 with open(f"{output_dir}/level_{level}.log", 'w') as f:
-                    for entry in entries:
+                    f.write(f"Total entries: {count}\n")
+                    f.write("-" * 80 + "\n")
+                    for entry in self.level_samples[level]:
                         f.write(f"{entry.original_message}\n")
             pbar.update(1)
 
             # Save module-based logs
-            for module, entries in self.logs_by_module.items():
+            for module, count in self.module_counts.items():
                 safe_module = re.sub(r'[^\w\-_\.]', '_', module)
                 with open(f"{output_dir}/module_{safe_module}.log", 'w') as f:
-                    for entry in entries:
+                    f.write(f"Total entries: {count}\n")
+                    f.write("-" * 80 + "\n")
+                    for entry in self.module_samples[module]:
                         f.write(f"{entry.original_message}\n")
             pbar.update(1)
 
             # Save height-based logs
-            height_ranges = defaultdict(list)
-            for height, entries in self.logs_by_height.items():
-                range_key = f"{height//1000}xxx"  # Group by thousands
-                height_ranges[range_key].extend(entries)
-            
-            for range_key, entries in height_ranges.items():
+            height_ranges = defaultdict(int)
+            height_range_samples = defaultdict(list)
+
+            for height, count in self.height_counts.items():
+                range_key = f"{height//1000}xxx"
+                height_ranges[range_key] += count
+
+                # Keep sample entries for each range
+                if len(height_range_samples[range_key]) < self.max_samples:
+                    height_range_samples[range_key].extend(
+                        self.height_samples.get(height, [])[:self.max_samples - len(height_range_samples[range_key])]
+                    )
+
+            for range_key, count in height_ranges.items():
                 with open(f"{output_dir}/height_{range_key}.log", 'w') as f:
-                    for entry in sorted(entries, key=lambda x: x.height):
+                    f.write(f"Total entries in range: {count}\n")
+                    f.write("-" * 80 + "\n")
+                    for entry in sorted(height_range_samples[range_key], key=lambda x: x.height):
                         f.write(f"{entry.original_message}\n")
             pbar.update(1)
 
             # Save pattern-based logs (top patterns only)
-            top_patterns = sorted(self.pattern_groups.items(), key=lambda x: len(x[1]), reverse=True)[:50]
-            for i, (pattern, entries) in enumerate(top_patterns):
+            top_patterns = sorted(
+                self.pattern_counts.items(),
+                key=lambda x: x[1],
+                reverse=True
+            )[:50]
+
+            for i, (pattern, count) in enumerate(top_patterns):
                 with open(f"{output_dir}/pattern_{i:03d}.log", 'w') as f:
                     f.write(f"Pattern: {pattern}\n")
-                    f.write(f"Occurrences: {len(entries)}\n")
+                    f.write(f"Occurrences: {count}\n")
                     f.write("-" * 80 + "\n")
-                    for entry in entries:
+                    for entry in self.pattern_samples[pattern]:
                         f.write(f"{entry.original_message}\n")
             pbar.update(1)
 
@@ -246,7 +293,7 @@ def show_exclusion_patterns_menu():
     print("\n=== Common patterns to exclude ===")
     patterns = [
         ("Debug level logs", r'DBG|debug'),
-        ("Info level logs", r'INFO|info'),
+("Info level logs", r'INFO|info'),
         ("Consensus-related logs", r'module="consensus"'),
         ("Height-related logs", r'height=\d+'),
         ("Peer-related logs", r'peer=[a-f0-9]+'),
