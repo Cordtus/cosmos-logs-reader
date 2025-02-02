@@ -13,90 +13,127 @@ from tqdm import tqdm
 import readline
 import sys
 from enum import Enum
-import signal
+
+class LogFormat(Enum):
+    JSON = "json"
+    TEXT = "text"
 
 @dataclass
 class LogEntry:
     timestamp: str
-    method: str
-    status: str
-    ip: str
-    normalized_message: str
+    level: str
+    module: Optional[str]
+    message: str
+    height: Optional[int]
     original_message: str
+    normalized_message: str
+    metadata: Dict[str, Any]
 
-class AdvancedLogAnalyzer:
-    def __init__(self, chunk_size=1024*1024*10):  # 10MB chunks
+class TendermintLogAnalyzer:
+    def __init__(self, chunk_size=1024*1024*10):
         self.chunk_size = chunk_size
         self.pattern_lock = threading.Lock()
         self.results_queue = queue.Queue()
-        self.dynamic_patterns = [
+        
+        # Tendermint/Cosmos specific patterns
+        self.patterns = [
             r'height=\d+',
+            r'H:\d+',
             r'peer=[a-f0-9]+',
             r'block_app_hash=[A-F0-9]+',
-            r'\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b',
-            r':\d{4,5}',
-            r'\b[a-fA-F0-9]{40,64}\b',
-            r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}.\d+Z'
+            r'block_hash=[A-F0-9]+',
+            r'\b[a-fA-F0-9]{40,64}\b',  # For addresses, hashes
+            r'chId=\d+',
+            r'num_txs=\d+',
+            r'round=\d+',
+            r'\[\d+\]',  # For vote indices
+            r'@[^:]+:\d+',  # For peer addresses
+            r'latency_ms=\d+'
         ]
         
         self.logs_by_time = defaultdict(list)
-        self.logs_by_method = defaultdict(list)
-        self.logs_by_status = defaultdict(list)
-        self.logs_by_ip = defaultdict(list)
+        self.logs_by_level = defaultdict(list)
+        self.logs_by_module = defaultdict(list)
+        self.logs_by_height = defaultdict(list)
         self.pattern_groups = defaultdict(list)
 
-    def process_chunk(self, chunk: str, exclude_patterns: Set[str]) -> List[LogEntry]:
+    def detect_format(self, first_line: str) -> LogFormat:
+        try:
+            json.loads(first_line)
+            return LogFormat.JSON
+        except:
+            return LogFormat.TEXT
+
+    def parse_json_log(self, line: str) -> Optional[LogEntry]:
+        try:
+            data = json.loads(line)
+            return LogEntry(
+                timestamp=data.get('time', ''),
+                level=data.get('level', '').upper(),
+                module=data.get('module', ''),
+                message=data.get('message', ''),
+                height=data.get('height'),
+                original_message=line,
+                normalized_message=self.normalize_message(data.get('message', '')),
+                metadata=data
+            )
+        except:
+            return None
+
+    def parse_text_log(self, line: str) -> Optional[LogEntry]:
+        try:
+            # Match pattern like: "3:05PM DBG Received bytes chID=32..."
+            match = re.match(r'^([\d:APM]+)\s+(\w+)\s+(.+)$', line)
+            if match:
+                timestamp, level, message = match.groups()
+                
+                # Extract module if present
+                module = None
+                module_match = re.search(r'module=(\w+)', message)
+                if module_match:
+                    module = module_match.group(1)
+                
+                # Extract height if present
+                height = None
+                height_match = re.search(r'height=(\d+)', message)
+                if height_match:
+                    height = int(height_match.group(1))
+                
+                return LogEntry(
+                    timestamp=timestamp,
+                    level=level,
+                    module=module,
+                    message=message,
+                    height=height,
+                    original_message=line,
+                    normalized_message=self.normalize_message(message),
+                    metadata={'raw_level': level}
+                )
+        except:
+            return None
+        return None
+
+    def normalize_message(self, message: str) -> str:
+        normalized = message
+        with self.pattern_lock:
+            for pattern in self.patterns:
+                normalized = re.sub(pattern, '<DYNAMIC>', normalized)
+        return normalized
+
+    def process_chunk(self, chunk: str, log_format: LogFormat, exclude_patterns: Set[str]) -> List[LogEntry]:
         entries = []
         for line in chunk.splitlines():
             if not line.strip():
                 continue
 
-            try:
-                # Extract timestamp
-                timestamp_str = ' '.join(line.split()[:2])
+            entry = None
+            if log_format == LogFormat.JSON:
+                entry = self.parse_json_log(line)
+            else:
+                entry = self.parse_text_log(line)
 
-                # Parse JSON data
-                request_start = line.find('Request: {')
-                response_start = line.find('} Response:')
-                
-                if request_start != -1 and response_start != -1:
-                    request_data = json.loads(line[request_start+9:response_start+1])
-                    response_data = json.loads(line[response_start+11:])
-
-                    # Extract key fields
-                    method = request_data.get('method', 'unknown')
-                    status = response_data.get('status', 'unknown')
-                    
-                    # Extract IP with fallback patterns
-                    ip = 'unknown'
-                    connecting_ip = request_data.get('connectingIP', '')
-                    ip_match = re.search(r'cf-connecting-ip: ([\d\.]+)', connecting_ip)
-                    if ip_match:
-                        ip = ip_match.group(1)
-
-                    # Create simplified pattern for grouping
-                    pattern_parts = [
-                        request_data.get('method', ''),
-                        request_data.get('backend_name', ''),
-                        request_data.get('url', '').split('?')[0],  # Base URL without params
-                    ]
-                    normalized = '|'.join(pattern_parts)
-                    
-                    # Check exclusion patterns
-                    if any(re.search(pattern, normalized) for pattern in exclude_patterns):
-                        continue
-
-                    entries.append(LogEntry(
-                        timestamp=timestamp_str,
-                        method=method,
-                        status=status,
-                        ip=ip,
-                        normalized_message=normalized,
-                        original_message=line
-                    ))
-
-            except Exception as e:
-                continue
+            if entry and not any(re.search(pattern, entry.normalized_message) for pattern in exclude_patterns):
+                entries.append(entry)
 
         return entries
 
@@ -104,16 +141,21 @@ class AdvancedLogAnalyzer:
         if exclude_patterns is None:
             exclude_patterns = set()
 
-        file_size = os.path.getsize(filename)
-        chunks = []
-        
         # Reset previous analysis
         self.logs_by_time.clear()
-        self.logs_by_method.clear()
-        self.logs_by_status.clear()
-        self.logs_by_ip.clear()
+        self.logs_by_level.clear()
+        self.logs_by_module.clear()
+        self.logs_by_height.clear()
         self.pattern_groups.clear()
+
+        file_size = os.path.getsize(filename)
         
+        # Detect format from first line
+        with open(filename, 'r') as f:
+            first_line = f.readline().strip()
+            log_format = self.detect_format(first_line)
+
+        chunks = []
         with open(filename, 'rb') as f:
             mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
             
@@ -127,7 +169,7 @@ class AdvancedLogAnalyzer:
 
         with concurrent.futures.ThreadPoolExecutor() as executor:
             futures = [
-                executor.submit(self.process_chunk, chunk, exclude_patterns)
+                executor.submit(self.process_chunk, chunk, log_format, exclude_patterns)
                 for chunk in chunks
             ]
             
@@ -137,47 +179,65 @@ class AdvancedLogAnalyzer:
                     self._organize_entries(entries)
                     pbar.update(1)
 
-        print(f"\nProcessed {len(self.pattern_groups)} unique log patterns")
+        print(f"\nProcessed {sum(len(entries) for entries in self.pattern_groups.values())} log entries")
 
     def _organize_entries(self, entries: List[LogEntry]) -> None:
         for entry in entries:
             self.logs_by_time[entry.timestamp].append(entry)
-            self.logs_by_method[entry.method].append(entry)
-            self.logs_by_status[entry.status].append(entry)
-            self.logs_by_ip[entry.ip].append(entry)
+            if entry.level:
+                self.logs_by_level[entry.level].append(entry)
+            if entry.module:
+                self.logs_by_module[entry.module].append(entry)
+            if entry.height is not None:
+                self.logs_by_height[entry.height].append(entry)
             self.pattern_groups[entry.normalized_message].append(entry)
 
     def save_organized_logs(self, output_dir: str) -> None:
         os.makedirs(output_dir, exist_ok=True)
         
-        with tqdm(total=4, desc="Saving organized logs") as pbar:
+        with tqdm(total=5, desc="Saving organized logs") as pbar:
             # Save time-based logs
-            for time, entries in self.logs_by_time.items():
-                safe_time = re.sub(r'[^\w\-_\. ]', '_', time)
+            for time_key, entries in self.logs_by_time.items():
+                safe_time = re.sub(r'[^\w\-_\. ]', '_', time_key)
                 with open(f"{output_dir}/time_{safe_time}.log", 'w') as f:
                     for entry in entries:
                         f.write(f"{entry.original_message}\n")
             pbar.update(1)
 
-            # Save method-based logs
-            for method, entries in self.logs_by_method.items():
-                with open(f"{output_dir}/method_{method}.log", 'w') as f:
+            # Save level-based logs
+            for level, entries in self.logs_by_level.items():
+                with open(f"{output_dir}/level_{level}.log", 'w') as f:
                     for entry in entries:
                         f.write(f"{entry.original_message}\n")
             pbar.update(1)
 
-            # Save status-based logs
-            for status, entries in self.logs_by_status.items():
-                with open(f"{output_dir}/status_{status}.log", 'w') as f:
+            # Save module-based logs
+            for module, entries in self.logs_by_module.items():
+                safe_module = re.sub(r'[^\w\-_\.]', '_', module)
+                with open(f"{output_dir}/module_{safe_module}.log", 'w') as f:
                     for entry in entries:
                         f.write(f"{entry.original_message}\n")
             pbar.update(1)
 
-            # Save IP-based logs (top IPs only)
-            top_ips = sorted(self.logs_by_ip.items(), key=lambda x: len(x[1]), reverse=True)[:20]
-            for ip, entries in top_ips:
-                safe_ip = ip.replace('.', '_')
-                with open(f"{output_dir}/ip_{safe_ip}.log", 'w') as f:
+            # Save height-based logs
+            height_ranges = defaultdict(list)
+            for height, entries in self.logs_by_height.items():
+                range_key = f"{height//1000}xxx"  # Group by thousands
+                height_ranges[range_key].extend(entries)
+            
+            for range_key, entries in height_ranges.items():
+                with open(f"{output_dir}/height_{range_key}.log", 'w') as f:
+                    for entry in sorted(entries, key=lambda x: x.height):
+                        f.write(f"{entry.original_message}\n")
+            pbar.update(1)
+
+            # Save pattern-based logs (top patterns only)
+            top_patterns = sorted(self.pattern_groups.items(), key=lambda x: len(x[1]), reverse=True)[:50]
+            for i, (pattern, entries) in enumerate(top_patterns):
+                with open(f"{output_dir}/pattern_{i:03d}.log", 'w') as f:
+                    f.write(f"Pattern: {pattern}\n")
+                    f.write(f"Occurrences: {len(entries)}\n")
+                    f.write("-" * 80 + "\n")
                     for entry in entries:
                         f.write(f"{entry.original_message}\n")
             pbar.update(1)
@@ -185,10 +245,12 @@ class AdvancedLogAnalyzer:
 def show_exclusion_patterns_menu():
     print("\n=== Common patterns to exclude ===")
     patterns = [
-        ("All successful responses (status 200)", r'"status":"200"'),
-        ("All OPTIONS requests", r'"method":"OPTIONS"'),
-        ("Specific IP", r'cf-connecting-ip: specific.ip.here'),
-        ("Specific endpoint", r'"url":"/specific/endpoint"'),
+        ("Debug level logs", r'DBG|debug'),
+        ("Info level logs", r'INFO|info'),
+        ("Consensus-related logs", r'module="consensus"'),
+        ("Height-related logs", r'height=\d+'),
+        ("Peer-related logs", r'peer=[a-f0-9]+'),
+        ("Block hash logs", r'block_hash=[A-F0-9]+'),
         ("Custom regex pattern", "custom")
     ]
     
@@ -204,16 +266,13 @@ def show_exclusion_patterns_menu():
         if 1 <= choice <= len(patterns):
             if patterns[choice-1][1] == "custom":
                 return input("Enter your custom regex pattern: ")
-            elif patterns[choice-1][1] == r'cf-connecting-ip: specific.ip.here':
-                ip = input("Enter IP address to exclude: ")
-                return f'cf-connecting-ip: {ip}'
             return patterns[choice-1][1]
     except (ValueError, IndexError):
         print("Invalid choice")
         return None
 
 def interactive_analyzer():
-    print("\nAdvanced Log Analyzer")
+    print("\nTendermint Log Analyzer")
     print("===================")
     
     filename = input("Enter log file path: ").strip()
@@ -223,7 +282,7 @@ def interactive_analyzer():
         
     output_dir = input("Enter output directory path: ").strip()
     
-    analyzer = AdvancedLogAnalyzer()
+    analyzer = TendermintLogAnalyzer()
     exclude_patterns = set()
 
     while True:
@@ -250,18 +309,26 @@ def interactive_analyzer():
                 print(f"Total logs: {sum(len(entries) for entries in analyzer.pattern_groups.values())}")
                 print(f"Unique patterns: {len(analyzer.pattern_groups)}")
                 
-                print("\nHTTP Methods:")
-                for method, entries in analyzer.logs_by_method.items():
-                    print(f"  {method}: {len(entries)}")
-                    
-                print("\nStatus Codes:")
-                for status, entries in analyzer.logs_by_status.items():
-                    print(f"  {status}: {len(entries)}")
-                    
-                print("\nTop IPs:")
-                top_ips = sorted(analyzer.logs_by_ip.items(), key=lambda x: len(x[1]), reverse=True)[:10]
-                for ip, entries in top_ips:
-                    print(f"  {ip}: {len(entries)}")
+                print("\nLog Levels:")
+                for level, entries in analyzer.logs_by_level.items():
+                    print(f"  {level}: {len(entries)}")
+                
+                print("\nTop Modules:")
+                sorted_modules = sorted(
+                    analyzer.logs_by_module.items(),
+                    key=lambda x: len(x[1]),
+                    reverse=True
+                )[:10]
+                for module, entries in sorted_modules:
+                    print(f"  {module}: {len(entries)}")
+
+                print("\nHeight Ranges:")
+                height_ranges = defaultdict(int)
+                for height, entries in analyzer.logs_by_height.items():
+                    range_key = f"{height//1000}xxx"
+                    height_ranges[range_key] += len(entries)
+                for range_key, count in sorted(height_ranges.items()):
+                    print(f"  {range_key}: {count}")
 
             elif choice == '3':
                 if not analyzer.pattern_groups:
@@ -320,45 +387,4 @@ def interactive_analyzer():
                         page_patterns = patterns[start_idx:end_idx]
 
                         print("\nCurrent patterns:")
-                        for i, (pattern, entries) in enumerate(page_patterns, start=start_idx):
-                            print(f"\n[{i}] {len(entries)} occurrences:")
-                            print(f"Pattern: {pattern}")
-                            print(f"Sample: {entries[0].original_message[:100]}...")
-
-                        pattern_choice = input("\nEnter pattern number to explore (or 'b' for back): ")
-                        if pattern_choice.lower() != 'b':
-                            try:
-                                idx = int(pattern_choice)
-                                if 0 <= idx < len(patterns):
-                                    pattern, entries = patterns[idx]
-                                    print(f"\n=== Sample logs for pattern {idx} ===")
-                                    for entry in entries[:5]:
-                                        print(f"\n{entry.original_message}")
-                                    input("\nPress Enter to continue...")
-                            except ValueError:
-                                print("Invalid pattern number")
-                    except Exception as e:
-                        print(f"Error: {str(e)}")
-                        
-            elif choice == '4':
-                pattern = show_exclusion_patterns_menu()
-                if pattern:
-                    exclude_patterns.add(pattern)
-                    print(f"Added exclusion pattern. Current patterns: {len(exclude_patterns)}")
-
-            elif choice == '5':
-                if not analyzer.pattern_groups:
-                    print("No analysis results. Please run analysis first.")
-                    continue
-                analyzer.save_organized_logs(output_dir)
-                print(f"Logs organized and saved to {output_dir}")
-
-            elif choice == '6':
-                break
-
-        except KeyboardInterrupt:
-            print("\nOperation cancelled. Returning to menu...")
-            continue
-
-if __name__ == "__main__":
-    interactive_analyzer()
+                        for i, (pattern, entries) in enumerate(page_patterns
