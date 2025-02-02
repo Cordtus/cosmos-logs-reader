@@ -387,4 +387,50 @@ def interactive_analyzer():
                         page_patterns = patterns[start_idx:end_idx]
 
                         print("\nCurrent patterns:")
-                        for i, (pattern, entries) in enumerate(page_patterns
+                        for i, (pattern, entries) in enumerate(page_patterns, start=start_idx):
+                            print(f"\n[{i}] {len(entries)} occurrences:")
+                            print(f"Pattern: {pattern}")
+                            print(f"Sample: {entries[0].original_message[:100]}...")
+
+                        pattern_choice = input("\nEnter pattern number to explore (or 'b' for back): ")
+                        if pattern_choice.lower() != 'b':
+                            try:
+                                idx = int(pattern_choice)
+                                if 0 <= idx < len(patterns):
+                                    pattern, entries = patterns[idx]
+                                    print(f"\n=== Sample logs for pattern {idx} ===")
+                                    for entry in entries[:5]:
+                                        print(f"\n{entry.original_message}")
+                                        if entry.module:
+                                            print(f"Module: {entry.module}")
+                                        if entry.height:
+                                            print(f"Height: {entry.height}")
+                                    input("\nPress Enter to continue...")
+                            except ValueError:
+                                print("Invalid pattern number")
+                    except Exception as e:
+                        print(f"Error: {str(e)}")
+                        continue
+
+            elif choice == '4':
+                pattern = show_exclusion_patterns_menu()
+                if pattern:
+                    exclude_patterns.add(pattern)
+                    print(f"Added exclusion pattern. Current patterns: {len(exclude_patterns)}")
+
+            elif choice == '5':
+                if not analyzer.pattern_groups:
+                    print("No analysis results. Please run analysis first.")
+                    continue
+                analyzer.save_organized_logs(output_dir)
+                print(f"Logs organized and saved to {output_dir}")
+
+            elif choice == '6':
+                break
+
+        except KeyboardInterrupt:
+            print("\nOperation cancelled. Returning to menu...")
+            continue
+
+if __name__ == "__main__":
+    interactive_analyzer()
